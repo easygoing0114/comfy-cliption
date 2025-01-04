@@ -20,6 +20,8 @@ Big thanks to [Ben Egan](https://github.com/ProGamerGov), [SilentAntagonist](htt
 
 # Installation
 
+Now available in the ComfyUI-Manager for easy install! Just search cliption and click install or you can follow steps below to install manually.
+
 1. Clone this repo to your ComfyUI/custom_nodes directory.
 ```shell
 cd custom_nodes
