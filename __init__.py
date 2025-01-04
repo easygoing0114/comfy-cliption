@@ -1,7 +1,7 @@
 import logging
 import os
 from types import SimpleNamespace
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -139,17 +139,7 @@ class CLIPtionModel(nn.Module):
         ramble: bool = False,
     ) -> List[str]:
         device = comfy.model_management.get_torch_device()
-
-        # encode images
-        image_outputs = self.clip_vision.encode_image(images)
-        image_features = image_outputs.last_hidden_state.to(device, dtype=torch.float16)
-        image_embeds = image_outputs.image_embeds.to(device, dtype=torch.float16)
-        image_embeds /= image_embeds.norm(dim=-1, keepdim=True)
-
-        if image_features.size(2) != 1024:
-            raise ValueError(
-                f"Expected image features to have 1024 dimensions but got {image_features.size(2)}. Please ensure you are using CLIP L."
-            )
+        image_features, image_embeds = self._images_to_embeds(images, device)
 
         captions = []
         for image_idx in range(image_features.size(0)):
@@ -194,6 +184,7 @@ class CLIPtionModel(nn.Module):
 
         return captions
 
+
     def generate_beam(
         self,
         images: torch.Tensor,
@@ -201,17 +192,7 @@ class CLIPtionModel(nn.Module):
         ramble: bool = False,
     ) -> List[str]:
         device = comfy.model_management.get_torch_device()
-
-        # get image features and embeddings
-        image_outputs = self.clip_vision.encode_image(images)
-        image_features = image_outputs.last_hidden_state.to(device, dtype=torch.float16)
-        image_embeds = image_outputs.image_embeds.to(device, dtype=torch.float16)
-        image_embeds /= image_embeds.norm(dim=-1, keepdim=True)
-
-        if image_features.size(2) != 1024:
-            raise ValueError(
-                f"Expected image features to have 1024 dimensions but got {image_features.size(2)}. Please ensure you are using CLIP L."
-            )
+        image_features, image_embeds = self._images_to_embeds(images, device)        
 
         captions = []
         for image_idx in range(image_features.size(0)):
@@ -404,6 +385,23 @@ class CLIPtionModel(nn.Module):
             clip_sim = torch.sum(image_embed * text_embeds, dim=-1)[0]
             candidates.append((clip_sim.item(), text))
         return candidates
+
+    def _images_to_embeds(self, images: torch.Tensor, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+        if images.size(-1) == 1:
+            images = images.repeat(1, 1, 1, 3)
+        elif images.size(-1) == 4:
+            images = images[..., :3]        
+
+        outputs = self.clip_vision.encode_image(images)
+        features = outputs.last_hidden_state.to(device, dtype=torch.float16)        
+        if features.size(2) != 1024:
+            raise ValueError(
+                f"Expected image features to have 1024 dimensions but got {features.size(2)}. Please ensure you are using CLIP L."
+            )
+        
+        embeds = outputs.image_embeds.to(device, dtype=torch.float16)
+        embeds /= embeds.norm(dim=-1, keepdim=True)
+        return features, embeds
 
     def _text_to_embed(self, text: str, device: torch.device) -> torch.Tensor:
         # load CLIP model and disable final projection since that's missing from comfy checkpoints
