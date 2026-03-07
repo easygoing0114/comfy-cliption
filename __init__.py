@@ -46,6 +46,13 @@ class DecoderBlock(nn.Module):
         memory: torch.Tensor,
         self_attn_mask: Optional[torch.Tensor] = None,
     ):
+        # 入力 x と memory を、このレイヤーの重みの型 (self.norm1.weight.dtype) に合わせる
+        # これにより、入力が Half でも自動的に Float に変換されます
+        x = x.to(self.norm1.weight.dtype)
+        memory = memory.to(self.norm1.weight.dtype)
+        if self_attn_mask is not None:
+            self_attn_mask = self_attn_mask.to(self.norm1.weight.dtype)
+
         # self attention with mask
         residual = x
         x = self.norm1(x)
@@ -187,11 +194,15 @@ class CLIPtionModel(nn.Module):
 
     def generate_beam(
         self,
-        images: torch.Tensor,
-        beam_width: int = 4,
+        image: torch.Tensor,
+        beam_width: int,
         ramble: bool = False,
     ) -> List[str]:
         device = comfy.model_management.get_torch_device()
+        # 追加: デコーダーモデル自体を入力と同じデバイス・型に移動させる
+        self.decoder.to(device) 
+        
+        # ... 既存の処理
         image_features, image_embeds = self._images_to_embeds(images, device)        
 
         captions = []
