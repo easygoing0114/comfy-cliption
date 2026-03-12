@@ -46,13 +46,6 @@ class DecoderBlock(nn.Module):
         memory: torch.Tensor,
         self_attn_mask: Optional[torch.Tensor] = None,
     ):
-        # 入力 x と memory を、このレイヤーの重みの型 (self.norm1.weight.dtype) に合わせる
-        # これにより、入力が Half でも自動的に Float に変換されます
-        x = x.to(self.norm1.weight.dtype)
-        memory = memory.to(self.norm1.weight.dtype)
-        if self_attn_mask is not None:
-            self_attn_mask = self_attn_mask.to(self.norm1.weight.dtype)
-
         # self attention with mask
         residual = x
         x = self.norm1(x)
@@ -108,7 +101,7 @@ class Captioner(nn.Module):
 
 
 class CLIPtionModel(nn.Module):
-    def __init__(self, config, clip, clip_vision):
+    def __init__(self, config, clip, clip_vision, device=None):
         super().__init__()
 
         if not hasattr(clip, "cond_stage_model"):
@@ -119,6 +112,8 @@ class CLIPtionModel(nn.Module):
         # store CLIP model references
         self.clip_text = clip
         self.clip_vision = clip_vision
+        # use specified device, or fall back to ComfyUI default at runtime
+        self.inference_device = device
         self.tokenizer = clip.tokenizer.clip_l.tokenizer
         self.text_model = clip.cond_stage_model.clip_l.transformer.text_model
         self.vision_model = clip_vision.model.vision_model
@@ -145,7 +140,7 @@ class CLIPtionModel(nn.Module):
         best_of: int = 1,
         ramble: bool = False,
     ) -> List[str]:
-        device = comfy.model_management.get_torch_device()
+        device = self._get_device()
         image_features, image_embeds = self._images_to_embeds(images, device)
 
         captions = []
@@ -194,15 +189,11 @@ class CLIPtionModel(nn.Module):
 
     def generate_beam(
         self,
-        image: torch.Tensor,
-        beam_width: int,
+        images: torch.Tensor,
+        beam_width: int = 4,
         ramble: bool = False,
     ) -> List[str]:
-        device = comfy.model_management.get_torch_device()
-        # 追加: デコーダーモデル自体を入力と同じデバイス・型に移動させる
-        self.decoder.to(device) 
-        
-        # ... 既存の処理
+        device = self._get_device()
         image_features, image_embeds = self._images_to_embeds(images, device)        
 
         captions = []
@@ -226,6 +217,12 @@ class CLIPtionModel(nn.Module):
     def get_tokenizer(self) -> CLIPTokenizer:
         return self.tokenizer
 
+    def _get_device(self) -> torch.device:
+        """Return the inference device: explicit override > ComfyUI default."""
+        if self.inference_device is not None:
+            return self.inference_device
+        return comfy.model_management.get_torch_device()
+
     def _batch_generate(
         self,
         image_features: torch.Tensor,
@@ -240,7 +237,9 @@ class CLIPtionModel(nn.Module):
         pos_embedding_ = self.text_model.embeddings.position_embedding
 
         # project and add positional embeddings to image features
-        memory = self.captioner.projection(image_features)
+        # determine dtype from captioner weights to handle FP32 models correctly
+        model_dtype = next(self.captioner.parameters()).dtype
+        memory = self.captioner.projection(image_features.to(dtype=model_dtype))
         memory = memory + self.captioner.memory_pos_embedding
         memory = memory.repeat(batch_size, 1, 1)
 
@@ -265,7 +264,8 @@ class CLIPtionModel(nn.Module):
             token_embeddings = token_embedding_(sequences[:, :current_length])
             positions = torch.arange(current_length, device=sequences.device)
             pos_embeddings = pos_embedding_(positions)
-            x = token_embeddings + pos_embeddings
+            # cast to model dtype to handle FP32/FP16 mismatch
+            x = (token_embeddings + pos_embeddings).to(dtype=model_dtype)
 
             # pass through decoder layers
             mask = self.captioner.causal_mask[:current_length, :current_length]
@@ -312,7 +312,9 @@ class CLIPtionModel(nn.Module):
         vocab_size = tokenizer.vocab_size
 
         # project image features
-        memory = captioner.projection(image_features)
+        # determine dtype from captioner weights to handle FP32 models correctly
+        model_dtype = next(captioner.parameters()).dtype
+        memory = captioner.projection(image_features.to(dtype=model_dtype))
         memory = memory + captioner.memory_pos_embedding
 
         # start with beam_width copies of BOS token
@@ -328,7 +330,8 @@ class CLIPtionModel(nn.Module):
             token_embeddings = token_embedding(current_tokens)
             positions = torch.arange(current_tokens.size(1), device=device)
             pos_embeddings = pos_embedding(positions)
-            x = token_embeddings + pos_embeddings
+            # cast to model dtype to handle FP32/FP16 mismatch
+            x = (token_embeddings + pos_embeddings).to(dtype=model_dtype)
 
             # run decoder layers
             seq_len = x.size(1)
@@ -404,14 +407,16 @@ class CLIPtionModel(nn.Module):
             images = images[..., :3]        
 
         outputs = self.clip_vision.encode_image(images)
-        features = outputs.last_hidden_state.to(device, dtype=torch.float16)        
+        # features go into the FP16 CLIPtion decoder, so cast to FP16
+        features = outputs.last_hidden_state.to(device, dtype=torch.float16)
         if features.size(2) != 1024:
             raise ValueError(
                 f"Expected image features to have 1024 dimensions but got {features.size(2)}. Please ensure you are using CLIP L."
             )
-        
-        embeds = outputs.image_embeds.to(device, dtype=torch.float16)
-        embeds /= embeds.norm(dim=-1, keepdim=True)
+
+        # embeds are used only for CLIP similarity scoring, preserve original dtype (FP32) for accuracy
+        embeds = outputs.image_embeds.to(device)
+        embeds = embeds / embeds.norm(dim=-1, keepdim=True)
         return features, embeds
 
     def _text_to_embed(self, text: str, device: torch.device) -> torch.Tensor:
@@ -424,7 +429,8 @@ class CLIPtionModel(nn.Module):
         tokens = self.clip_text.tokenize(text)
         clip_l = self.clip_text.cond_stage_model.clip_l
         _, pooled = clip_l.encode_token_weights(tokens["l"])
-        text_embeds = self.text_projection(pooled.to(device, dtype=torch.float16))
+        # preserve original dtype (FP32) for accurate CLIP similarity scoring
+        text_embeds = self.text_projection(pooled.to(device))
         text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)
         return text_embeds
 
@@ -443,10 +449,13 @@ class CLIPtionLoader:
                     {"tooltip": "The CLIP model used for encoding the text."},
                 ),
                 "clip_vision": ("CLIP_VISION",),
-            }
+            },
+            "optional": {
+                "device": (["default", "cpu"], {"advanced": True}),
+            },
         }
 
-    def load(self, clip, clip_vision):
+    def load(self, clip, clip_vision, device="default"):
         state_dict = {}
         file = "CLIPtion_20241219_fp16.safetensors"
         base_path = os.path.dirname(os.path.abspath(__file__))
@@ -466,11 +475,19 @@ class CLIPtionLoader:
         config = SimpleNamespace(
             **{"hidden_dim": 768, "num_heads": 8, "num_blocks": 6, "max_length": 77}
         )
-        model = CLIPtionModel(config, clip, clip_vision)
+
+        # resolve inference device: explicit "cpu" overrides ComfyUI default
+        inference_device = torch.device("cpu") if device == "cpu" else None
+
+        model = CLIPtionModel(config, clip, clip_vision, device=inference_device)
         model.captioner.load_state_dict(state_dict)
         model.text_projection.load_state_dict(tp_dict)
         model.eval()
-        model.to(comfy.model_management.get_torch_device(), dtype=torch.float16)
+
+        load_device = inference_device if inference_device is not None else comfy.model_management.get_torch_device()
+        model.to(load_device, dtype=torch.float16)
+        # keep text_projection in FP32 to preserve CLIP similarity scoring accuracy
+        model.text_projection.to(dtype=torch.float32)
         return (model,)
 
 
@@ -567,14 +584,146 @@ class CLIPtionBeamSearch:
         return (captions,)
 
 
+class CLIPtionBeamSearchNode:
+    """
+    Combined CLIPtion loader + beam search node.
+    Loads the CLIPtion decoder on demand at caption time rather than at
+    workflow-load time, and can optionally unload it from VRAM afterwards.
+    The CLIPtion safetensors weights are kept on CPU between runs so that
+    re-loading does not require a disk read.
+    """
+
+    CATEGORY = "pharmapsychotic"
+    FUNCTION = "caption"
+    OUTPUT_IS_LIST = (True,)
+    RETURN_TYPES = ("STRING",)
+
+    # CLIPtion decoder config (fixed for the released checkpoint)
+    _CAPTIONER_CONFIG = SimpleNamespace(
+        hidden_dim=768, num_heads=8, num_blocks=6, max_length=77
+    )
+    _SAFETENSORS_FILE = "CLIPtion_20241219_fp16.safetensors"
+    _HF_REPO_ID = "pharmapsychotic/CLIPtion"
+    _HF_REVISION = "15ee8cb77a902616478a033332011ff640e72277"
+
+    def __init__(self):
+        self._model: Optional[CLIPtionModel] = None
+
+    # ------------------------------------------------------------------
+    # Node interface
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "clip": ("CLIP", {"tooltip": "CLIP text encoder (must include CLIP-L)."}),
+                "clip_vision": ("CLIP_VISION", {"tooltip": "CLIP vision encoder (must be CLIP-L)."}),
+                "image": ("IMAGE",),
+                "beam_width": (
+                    "INT",
+                    {
+                        "default": 4,
+                        "min": 1,
+                        "max": 64,
+                        "tooltip": "Number of beams to maintain during search.",
+                    },
+                ),
+                "unload_after_run": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Unload CLIPtion decoder from VRAM after captioning.",
+                    },
+                ),
+            },
+            "optional": {
+                "ramble": ("BOOLEAN", {"default": False}),
+                "device": (["default", "cpu"], {"advanced": True}),
+            },
+        }
+
+    def caption(
+        self,
+        clip,
+        clip_vision,
+        image: torch.Tensor,
+        beam_width: int = 4,
+        unload_after_run: bool = False,
+        ramble: bool = False,
+        device: str = "default",
+    ):
+        try:
+            self._load_model(clip, clip_vision, device)
+            with torch.inference_mode():
+                captions = self._model.generate_beam(image, beam_width, ramble)
+        finally:
+            if unload_after_run:
+                self._unload_model()
+
+        return (captions,)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _load_model(self, clip, clip_vision, device: str):
+        """Load CLIPtion decoder from disk and move to target device."""
+        if self._model is not None:
+            return
+
+        base_path = os.path.dirname(os.path.abspath(__file__))
+        local_path = os.path.join(base_path, self._SAFETENSORS_FILE)
+        if os.path.exists(local_path):
+            model_path = local_path
+        else:
+            model_path = hf_hub_download(
+                repo_id=self._HF_REPO_ID,
+                filename=self._SAFETENSORS_FILE,
+                revision=self._HF_REVISION,
+            )
+
+        state_dict = {}
+        with safe_open(model_path, framework="pt", device="cpu") as f:
+            for key in f.keys():
+                state_dict[key] = f.get_tensor(key)
+        tp_dict = {"weight": state_dict.pop("text_projection.weight")}
+
+        inference_device = torch.device("cpu") if device == "cpu" else None
+        model = CLIPtionModel(self._CAPTIONER_CONFIG, clip, clip_vision, device=inference_device)
+        model.captioner.load_state_dict(state_dict)
+        model.text_projection.load_state_dict(tp_dict)
+        model.eval()
+
+        load_device = inference_device if inference_device is not None else comfy.model_management.get_torch_device()
+        model.to(load_device, dtype=torch.float16)
+        # keep text_projection in FP32 to preserve CLIP similarity scoring accuracy
+        model.text_projection.to(dtype=torch.float32)
+
+        self._model = model
+        logging.info(f"CLIPtionBeamSearchNode: decoder loaded on {load_device}")
+
+    def _unload_model(self):
+        """Remove the CLIPtion decoder from VRAM and CPU RAM completely."""
+        if self._model is None:
+            return
+        del self._model
+        self._model = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        logging.info("CLIPtionBeamSearchNode: decoder unloaded")
+
+
 NODE_CLASS_MAPPINGS = {
     "CLIPtionBeamSearch": CLIPtionBeamSearch,
+    "CLIPtionBeamSearchNode": CLIPtionBeamSearchNode,
     "CLIPtionGenerate": CLIPtionGenerate,
     "CLIPtionLoader": CLIPtionLoader,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "CLIPtionBeamSearch": "CLIPtion Beam Search",
+    "CLIPtionBeamSearchNode": "CLIPtion Beam Search (Integrated)",
     "CLIPtionGenerate": "CLIPtion Generate",
     "CLIPtionLoader": "CLIPtion Loader",
 }
