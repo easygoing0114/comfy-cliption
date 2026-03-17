@@ -390,8 +390,13 @@ class CLIPtionModel(nn.Module):
         # rank final candidates by CLIP similarity
         candidates = []
         for idx in range(beam_width):
+            tokens = current_tokens[idx]
+            # trim everything after the first EOS token (inclusive) before decoding
+            eos_positions = (tokens == tokenizer.eos_token_id).nonzero(as_tuple=True)[0]
+            if len(eos_positions) > 0:
+                tokens = tokens[: eos_positions[0]]
             text = tokenizer.decode(
-                current_tokens[idx],
+                tokens,
                 skip_special_tokens=True,
                 clean_up_tokenization_spaces=True,
             )
